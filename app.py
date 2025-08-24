@@ -1,40 +1,37 @@
 import os
 import time
+import inspect
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
-# unofficial TextNow wrapper
-from pythontextnow import Client  # works with different variants of the lib
+# Unofficial TextNow wrapper
+from pythontextnow import Client
 
-# cache the client for ~30 minutes
+# Cache the client ~30 minutes
 _CLIENT = None
 _CLIENT_TS = 0
 
 
 def get_client():
     """
-    Supports BOTH pythontextnow variants:
-    - Variant A: Client(email, password)  OR  Client("", sid_cookie=...)
-    - Variant B: Client() then login via a method:
-        * client.login(email, password)  or client.log_in(...) / client.sign_in(...)
-        * client.login_sid(cookie)       or client.log_in_sid(...) / client.login_with_sid(...) / client.set_sid(...)
-    We try constructor-first, fall back to no-arg + login method.
+    Works with multiple pythontextnow variants:
+    - Variant A: Client(email, password)  or  Client("", sid_cookie=...)
+    - Variant B: Client(); then .login(email,password) or .login_sid(cookie) (or similar)
     """
     global _CLIENT, _CLIENT_TS
-
     email = os.environ.get("TEXTNOW_EMAIL")
     password = os.environ.get("TEXTNOW_PASSWORD")
-    sid_cookie = os.environ.get("TEXTNOW_SID_COOKIE")  # optional alternative auth
+    sid_cookie = os.environ.get("TEXTNOW_SID_COOKIE")
 
     if not ((email and password) or sid_cookie):
         raise RuntimeError("TEXTNOW_EMAIL (and TEXTNOW_PASSWORD) or TEXTNOW_SID_COOKIE must be set.")
 
-    # reuse client if fresh (< 30 minutes)
+    # reuse existing client if still fresh
     if _CLIENT and (time.time() - _CLIENT_TS < 1800):
         return _CLIENT
 
-    # ----- Try Variant A: args in constructor
+    # Try constructor-first
     try:
         if sid_cookie:
             client = Client("", sid_cookie=sid_cookie)
@@ -44,41 +41,37 @@ def get_client():
         _CLIENT_TS = time.time()
         return _CLIENT
     except TypeError:
-        # If constructor doesn't accept args, fall back to Variant B
+        # Fallback: no-arg then login method
         client = Client()
-
-        # cookie-based login first if provided
         if sid_cookie:
-            for method_name in ("login_sid", "log_in_sid", "login_with_sid", "set_sid"):
-                if hasattr(client, method_name):
-                    getattr(client, method_name)(sid_cookie)
+            for m in ("login_sid", "log_in_sid", "login_with_sid", "set_sid"):
+                if hasattr(client, m) and callable(getattr(client, m)):
+                    getattr(client, m)(sid_cookie)
                     break
             else:
-                # last resort: try setting an attribute directly
                 try:
                     setattr(client, "sid_cookie", sid_cookie)
                 except Exception:
                     pass
         else:
-            # email/password login
-            for method_name in ("login", "log_in", "sign_in"):
-                if hasattr(client, method_name):
-                    getattr(client, method_name)(email, password)
+            for m in ("login", "log_in", "sign_in"):
+                if hasattr(client, m) and callable(getattr(client, m)):
+                    getattr(client, m)(email, password)
                     break
             else:
-                raise RuntimeError("Could not find a login(email, password) method on pythontextnow.Client")
+                raise RuntimeError("Could not find a login(email,password) method on pythontextnow.Client")
 
         _CLIENT = client
         _CLIENT_TS = time.time()
         return _CLIENT
 
 
-app = FastAPI(title="TextNow SMS Microservice (Unofficial)", version="1.0.0")
+app = FastAPI(title="TextNow SMS Microservice (Unofficial)", version="1.1.0")
 
-# open CORS so you can call from medtext.online directly
+# CORS: open for your MVP; tighten allow_origins later if you want
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten later if you want
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,43 +83,125 @@ class SendBody(BaseModel):
     message: str = Field(..., min_length=1, max_length=480)
 
 
+def normalize_number(raw: str) -> str:
+    raw = raw.strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 10:
+        return "+1" + digits
+    if raw.startswith("+") and len(digits) >= 8:
+        return raw
+    raise HTTPException(status_code=400, detail="Invalid phone number format. Use 10-digit US or E.164.")
+
+
+def find_send_callable(client):
+    """
+    Dynamically discover a method on the client that can send an SMS.
+    We prefer obvious names first, then scan fallbacks.
+    Returns (callable, param_names_list)
+    """
+    preferred = [
+        "send_sms", "send_message", "send_text", "text", "send", "sms", "message",
+    ]
+    for name in preferred:
+        if hasattr(client, name) and callable(getattr(client, name)):
+            fn = getattr(client, name)
+            try:
+                sig = inspect.signature(fn)
+            except (TypeError, ValueError):
+                sig = None
+            params = list(sig.parameters.keys()) if sig else []
+            return fn, params
+
+    # Fallback: scan everything for 'send'/'text' in the name
+    for name, fn in inspect.getmembers(client, predicate=callable):
+        lname = name.lower()
+        if any(k in lname for k in ("send", "text", "sms", "message")) and not lname.startswith("_"):
+            try:
+                sig = inspect.signature(fn)
+            except (TypeError, ValueError):
+                sig = None
+            params = list(sig.parameters.keys()) if sig else []
+            return fn, params
+
+    return None, []
+
+
+def try_invoke_send(fn, params, to, message):
+    """
+    Try common positional and keyword combinations to call the discovered send function.
+    """
+    # Common phone param names and message param names we might see
+    phone_keys = ["to", "phone", "number", "recipient", "contact", "send_to"]
+    msg_keys = ["message", "text", "body", "content"]
+
+    # 1) Positional (to, message)
+    try:
+        return fn(to, message)
+    except TypeError:
+        pass
+    # 2) Positional swapped (message, to)
+    try:
+        return fn(message, to)
+    except TypeError:
+        pass
+    # 3) Keyword (to=, message=)
+    for pkey in phone_keys:
+        for mkey in msg_keys:
+            try:
+                return fn(**{pkey: to, mkey: message})
+            except TypeError:
+                continue
+    # 4) Keyword with only message (some libs infer last chat)
+    for mkey in msg_keys:
+        try:
+            return fn(**{mkey: message})
+        except TypeError:
+            continue
+
+    raise RuntimeError("Could not call the discovered send method with known argument patterns.")
+
+
 @app.get("/health")
 def health():
-    """Simple health check"""
-    return {"ok": True, "service": "textnow", "version": "1.0.0"}
+    return {"ok": True, "service": "textnow", "version": "1.1.0"}
+
+
+@app.get("/introspect")
+def introspect():
+    """
+    Helps us see what's on the Client when debugging.
+    Returns the methods that look like they could send messages and their parameter names.
+    """
+    try:
+        client = get_client()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Client init failed: {e}")
+
+    candidates = []
+    for name, fn in inspect.getmembers(client, predicate=callable):
+        lname = name.lower()
+        if any(k in lname for k in ("send", "text", "sms", "message")) and not lname.startswith("_"):
+            try:
+                sig = inspect.signature(fn)
+                params = list(sig.parameters.keys())
+            except Exception:
+                sig = None
+                params = []
+            candidates.append({"name": name, "params": params})
+    return {"candidates": candidates}
 
 
 @app.post("/send")
 def send_sms(body: SendBody):
-    # normalize US 10-digit -> +1
-    raw = body.to.strip()
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) == 10:
-        to = "+1" + digits
-    elif raw.startswith("+") and len(digits) >= 8:
-        to = raw
-    else:
-        raise HTTPException(status_code=400, detail="Invalid phone number format. Use 10-digit US or E.164.")
-
+    to = normalize_number(body.to)
     try:
         client = get_client()
-        # different libs use different method names, but send_sms is common
-        if hasattr(client, "send_sms"):
-            client.send_sms(to, body.message)
-        else:
-            # fallbacks if the wrapper used a different name
-            sent = False
-            for m in ("send_message", "send", "sms", "text"):
-                if hasattr(client, m):
-                    getattr(client, m)(to, body.message)
-                    sent = True
-                    break
-            if not sent:
-                raise RuntimeError("Could not find a send method on pythontextnow.Client")
-
+        fn, params = find_send_callable(client)
+        if not fn:
+            raise RuntimeError("Could not find a send method on pythontextnow.Client")
+        try_invoke_send(fn, params, to, body.message)
         return {"ok": True, "to": to, "message_len": len(body.message)}
     except HTTPException:
         raise
     except Exception as e:
-        # bubble up useful info but keep 502 so your frontend sees a clean error
         raise HTTPException(status_code=502, detail=f"Upstream TextNow error: {e}")
