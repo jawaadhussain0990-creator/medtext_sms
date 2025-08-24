@@ -1,14 +1,15 @@
 import os
 import time
 import inspect
+from typing import Callable, List, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
-# Unofficial TextNow wrapper
+# Unofficial TextNow wrapper (your uploaded wheel)
 from pythontextnow import Client
 
-# Cache the client ~30 minutes
+# Cache the client for 30 minutes
 _CLIENT = None
 _CLIENT_TS = 0
 
@@ -66,9 +67,9 @@ def get_client():
         return _CLIENT
 
 
-app = FastAPI(title="TextNow SMS Microservice (Unofficial)", version="1.1.0")
+app = FastAPI(title="TextNow SMS Microservice (Unofficial)", version="1.2.0")
 
-# CORS: open for your MVP; tighten allow_origins later if you want
+# Open CORS for your MVP; tighten later if you want
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -93,65 +94,112 @@ def normalize_number(raw: str) -> str:
     raise HTTPException(status_code=400, detail="Invalid phone number format. Use 10-digit US or E.164.")
 
 
-def find_send_callable(client):
+# ---------- dynamic discovery helpers ----------
+
+SEND_NAME_HINTS = ("send", "text", "sms", "message")
+
+
+def _method_signature(fn: Callable):
+    try:
+        return inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_methods(obj, prefix: str = "") -> List[Tuple[str, Callable]]:
     """
-    Dynamically discover a method on the client that can send an SMS.
-    We prefer obvious names first, then scan fallbacks.
-    Returns (callable, param_names_list)
+    Collect callables on obj (depth 0) and on its immediate attributes (depth 1).
+    Returns list of (path, fn), where path looks like 'client.send_sms' or 'client.messages.send'
     """
-    preferred = [
-        "send_sms", "send_message", "send_text", "text", "send", "sms", "message",
-    ]
-    for name in preferred:
-        if hasattr(client, name) and callable(getattr(client, name)):
-            fn = getattr(client, name)
-            try:
-                sig = inspect.signature(fn)
-            except (TypeError, ValueError):
-                sig = None
+    results: List[Tuple[str, Callable]] = []
+
+    # Depth 0: methods directly on obj
+    for name, fn in inspect.getmembers(obj, predicate=callable):
+        if name.startswith("_"):
+            continue
+        results.append((f"{prefix}{name}", fn))
+
+    # Depth 1: look into public attributes; if attribute has callables, collect them
+    for attr_name in dir(obj):
+        if attr_name.startswith("_"):
+            continue
+        try:
+            attr = getattr(obj, attr_name)
+        except Exception:
+            continue
+        # only drill into simple objects (avoid drilling into modules/classes)
+        if callable(attr):
+            # already captured above
+            continue
+        # scan callables on the attribute
+        for name, fn in inspect.getmembers(attr, predicate=callable):
+            if name.startswith("_"):
+                continue
+            results.append((f"{prefix}{attr_name}.{name}", fn))
+
+    return results
+
+
+def find_send_candidates(client) -> List[Tuple[str, Callable, List[str]]]:
+    """
+    Return list of candidate send functions as (path, fn, param_names).
+    We prefer obvious names first, but include everything that looks relevant.
+    """
+    methods = _collect_methods(client, prefix="client.")
+    candidates: List[Tuple[str, Callable, List[str]]] = []
+
+    # score preferred names higher
+    def score(path: str) -> int:
+        p = path.lower()
+        s = 0
+        # direct methods get a tiny boost
+        if p.count(".") == 1:
+            s += 1
+        for hint in SEND_NAME_HINTS:
+            if hint in p:
+                s += 2
+        # heavily weight common combos
+        if any(k in p for k in ("send_sms", "send_message", "text", "messages.send")):
+            s += 3
+        return s
+
+    ranked = sorted(methods, key=lambda x: score(x[0]), reverse=True)
+
+    for path, fn in ranked:
+        lp = path.lower()
+        if any(h in lp for h in SEND_NAME_HINTS):
+            sig = _method_signature(fn)
             params = list(sig.parameters.keys()) if sig else []
-            return fn, params
+            candidates.append((path, fn, params))
 
-    # Fallback: scan everything for 'send'/'text' in the name
-    for name, fn in inspect.getmembers(client, predicate=callable):
-        lname = name.lower()
-        if any(k in lname for k in ("send", "text", "sms", "message")) and not lname.startswith("_"):
-            try:
-                sig = inspect.signature(fn)
-            except (TypeError, ValueError):
-                sig = None
-            params = list(sig.parameters.keys()) if sig else []
-            return fn, params
-
-    return None, []
+    return candidates
 
 
-def try_invoke_send(fn, params, to, message):
+def try_invoke_send(fn: Callable, params: List[str], to: str, message: str):
     """
-    Try common positional and keyword combinations to call the discovered send function.
+    Try several positional/keyword combos to call the method.
     """
-    # Common phone param names and message param names we might see
     phone_keys = ["to", "phone", "number", "recipient", "contact", "send_to"]
     msg_keys = ["message", "text", "body", "content"]
 
-    # 1) Positional (to, message)
+    # 1) positional (to, message)
     try:
         return fn(to, message)
     except TypeError:
         pass
-    # 2) Positional swapped (message, to)
+    # 2) positional swapped (message, to)
     try:
         return fn(message, to)
     except TypeError:
         pass
-    # 3) Keyword (to=, message=)
+    # 3) keyword combos
     for pkey in phone_keys:
         for mkey in msg_keys:
             try:
                 return fn(**{pkey: to, mkey: message})
             except TypeError:
                 continue
-    # 4) Keyword with only message (some libs infer last chat)
+    # 4) message-only (some libs send to last/active chat)
     for mkey in msg_keys:
         try:
             return fn(**{mkey: message})
@@ -161,34 +209,27 @@ def try_invoke_send(fn, params, to, message):
     raise RuntimeError("Could not call the discovered send method with known argument patterns.")
 
 
+# --------------- endpoints ---------------
+
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "textnow", "version": "1.1.0"}
+    return {"ok": True, "service": "textnow", "version": "1.2.0"}
 
 
-@app.get("/introspect")
-def introspect():
+@app.get("/debug")
+def debug():
     """
-    Helps us see what's on the Client when debugging.
-    Returns the methods that look like they could send messages and their parameter names.
+    Show all candidate methods we think might send messages, including sub-objects.
     """
     try:
         client = get_client()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Client init failed: {e}")
 
-    candidates = []
-    for name, fn in inspect.getmembers(client, predicate=callable):
-        lname = name.lower()
-        if any(k in lname for k in ("send", "text", "sms", "message")) and not lname.startswith("_"):
-            try:
-                sig = inspect.signature(fn)
-                params = list(sig.parameters.keys())
-            except Exception:
-                sig = None
-                params = []
-            candidates.append({"name": name, "params": params})
-    return {"candidates": candidates}
+    cands = []
+    for path, fn, params in find_send_candidates(client):
+        cands.append({"path": path, "params": params})
+    return {"candidates": cands}
 
 
 @app.post("/send")
@@ -196,11 +237,25 @@ def send_sms(body: SendBody):
     to = normalize_number(body.to)
     try:
         client = get_client()
-        fn, params = find_send_callable(client)
-        if not fn:
-            raise RuntimeError("Could not find a send method on pythontextnow.Client")
-        try_invoke_send(fn, params, to, body.message)
-        return {"ok": True, "to": to, "message_len": len(body.message)}
+        candidates = find_send_candidates(client)
+        if not candidates:
+            raise RuntimeError("No candidate send methods found on pythontextnow.Client (or its sub-objects).")
+
+        # Try candidates in order until one succeeds
+        last_err = None
+        for path, fn, params in candidates:
+            try:
+                try_invoke_send(fn, params, to, body.message)
+                return {"ok": True, "used": path, "to": to, "message_len": len(body.message)}
+            except Exception as e:
+                last_err = e
+                continue
+
+        # If none succeeded:
+        if last_err:
+            raise RuntimeError(f"Discovered {len(candidates)} candidates but all failed. Last error: {last_err}")
+        raise RuntimeError("Discovered candidates but invocation failed without error details.")
+
     except HTTPException:
         raise
     except Exception as e:
