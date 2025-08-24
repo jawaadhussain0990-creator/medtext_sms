@@ -1,3 +1,4 @@
 fastapi==0.110.0
 uvicorn==0.29.0
+random-user-agent==1.0.1
 pythontextnow-1.1.0-py3-none-any.whl
